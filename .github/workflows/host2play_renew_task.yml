@@ -41,7 +41,7 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install botasaurus==4.0.97 requests==2.31.0 chrome-extension-python
+          pip install botasaurus==4.0.97 "requests[socks]==2.31.0" chrome-extension-python
 
       - name: Download & Extract Buster Plugin
         run: |
@@ -51,7 +51,15 @@ jobs:
           7z x -y extensions/buster/buster.zip -oextensions/buster/unpacked
 
       - name: Check IP
+        env:
+          HOST2PLAY_SOCKS5_PROXY: ${{ secrets.HOST2PLAY_SOCKS5_PROXY }}
+          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
         run: |
+          if [ -n "$HOST2PLAY_SOCKS5_PROXY" ]; then
+            export ALL_PROXY="$HOST2PLAY_SOCKS5_PROXY"
+          elif [ -n "$SOCKS5_PROXY" ]; then
+            export ALL_PROXY="$SOCKS5_PROXY"
+          fi
           echo "Current IP:"
           curl -s https://api.ipify.org
           echo
@@ -63,6 +71,8 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BUSTER_EXTENSION_PATH: ${{ github.workspace }}/extensions/buster/unpacked
+          HOST2PLAY_SOCKS5_PROXY: ${{ secrets.HOST2PLAY_SOCKS5_PROXY }}
+          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
         run: xvfb-run -a python host2play.py
 
       - name: Upload Screenshots
