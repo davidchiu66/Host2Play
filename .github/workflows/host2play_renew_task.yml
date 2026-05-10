@@ -35,7 +35,7 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install botasaurus==4.0.97 "requests[socks]==2.31.0" chrome-extension-python
+          pip install botasaurus==4.0.97 "requests[socks]==2.31.0" chrome-extension-python SpeechRecognition pydub
 
       - name: Download & Extract Buster Plugin
         run: |
@@ -81,6 +81,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: host2play-screenshots-${{ github.run_number }}
-          path: output/screenshots/*.png
+          path: |
+            output/screenshots/*.png
+            host2play_status.png
+            error_logs/**/screenshot.png
           retention-days: 7
           if-no-files-found: ignore
