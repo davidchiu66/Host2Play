@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import subprocess
 import requests
 from botasaurus.browser import browser, Driver
 
@@ -23,10 +24,19 @@ SCREENSHOT_NAME = "host2play_status.png"
 SCREENSHOT_PATH = os.path.join("output", "screenshots", SCREENSHOT_NAME)
 MAX_CAPTCHA_WAIT_SECONDS = 30
 POST_SOLVE_WAIT_SECONDS = 18
+MAX_RENEW_RETRIES_PER_URL = 3
 
 
 def log(message: str):
     print(f"[HOST2PLAY] {message}", flush=True)
+
+
+class CaptchaBlocked(Exception):
+    pass
+
+
+def human_sleep(seconds: int | float):
+    time.sleep(seconds)
 
 
 def send_tg_message(text: str, photo_path: str | None = None):
@@ -148,6 +158,43 @@ def save_status_screenshot(driver: Driver):
         log(f"Screenshot failed: {exc}")
 
 
+def restart_warp() -> bool:
+    log("Restarting WARP to rotate IP.")
+    try:
+        subprocess.run(
+            ["sudo", "warp-cli", "--accept-tos", "disconnect"],
+            check=False,
+            timeout=30,
+            capture_output=True,
+        )
+        human_sleep(3)
+        subprocess.run(
+            ["sudo", "warp-cli", "--accept-tos", "registration", "delete"],
+            check=False,
+            timeout=30,
+            capture_output=True,
+        )
+        human_sleep(2)
+        subprocess.run(
+            ["sudo", "warp-cli", "--accept-tos", "registration", "new"],
+            check=True,
+            timeout=30,
+            capture_output=True,
+        )
+        human_sleep(2)
+        subprocess.run(
+            ["sudo", "warp-cli", "--accept-tos", "connect"],
+            check=True,
+            timeout=30,
+            capture_output=True,
+        )
+        human_sleep(8)
+        return True
+    except Exception as exc:
+        log(f"WARP restart failed: {exc}")
+        return False
+
+
 def remove_overlays(driver: Driver):
     driver.run_js(
         """
@@ -168,6 +215,34 @@ def remove_overlays(driver: Driver):
 
 def human_pause(driver: Driver, seconds: int = 2):
     driver.sleep(seconds)
+
+
+def is_recaptcha_blocked(driver: Driver) -> bool:
+    if not wait_for_recaptcha_frame(driver, "iframe[src*='recaptcha/api2/bframe']", 5):
+        return False
+
+    try:
+        challenge = find_recaptcha_challenge_frame(driver)
+        blocked = challenge.run_js(
+            """
+            const blockedHeader = document.querySelector('.rc-doscaptcha-header-text');
+            const blockedBody = document.querySelector('.rc-doscaptcha-body-text');
+            const pageText = (document.body ? document.body.innerText : '').toLowerCase();
+
+            if (blockedHeader && blockedHeader.innerText.toLowerCase().includes('try again later')) {
+                return true;
+            }
+
+            if (blockedBody && blockedBody.innerText.toLowerCase().includes('automated queries')) {
+                return true;
+            }
+
+            return pageText.includes('try again later') || pageText.includes('automated queries');
+            """
+        )
+        return bool(blocked)
+    except Exception:
+        return False
 
 
 def click_first_matching_button(driver: Driver, snippets: list[str]) -> bool:
@@ -245,8 +320,12 @@ def click_recaptcha_checkbox(driver: Driver) -> bool:
         anchor = find_recaptcha_anchor_frame(driver)
         anchor.click("#recaptcha-anchor")
         human_pause(driver, 3)
+        if is_recaptcha_blocked(driver):
+            raise CaptchaBlocked("Google reCAPTCHA returned 'Try again later' right after checkbox click.")
         return True
     except Exception as exc:
+        if isinstance(exc, CaptchaBlocked):
+            raise
         log(f"Failed to click reCAPTCHA checkbox: {exc}")
         return False
 
@@ -259,6 +338,8 @@ def switch_recaptcha_to_audio(driver: Driver) -> bool:
     for attempt in range(1, 5):
         try:
             challenge = find_recaptcha_challenge_frame(driver)
+            if is_recaptcha_blocked(driver):
+                raise CaptchaBlocked("Google reCAPTCHA blocked the current IP before audio mode opened.")
             if challenge.run_js("return !!document.querySelector('#audio-response');"):
                 log("reCAPTCHA already in audio mode.")
                 return True
@@ -266,10 +347,14 @@ def switch_recaptcha_to_audio(driver: Driver) -> bool:
             try:
                 challenge.click("#recaptcha-audio-button")
                 human_pause(driver, 3)
+                if is_recaptcha_blocked(driver):
+                    raise CaptchaBlocked("Google reCAPTCHA blocked the current IP when switching to audio mode.")
                 if challenge.run_js("return !!document.querySelector('#audio-response');"):
                     log(f"Switched reCAPTCHA to audio mode on attempt {attempt}.")
                     return True
-            except Exception:
+            except Exception as exc:
+                if isinstance(exc, CaptchaBlocked):
+                    raise
                 pass
 
             clicked = challenge.run_js(
@@ -301,10 +386,14 @@ def switch_recaptcha_to_audio(driver: Driver) -> bool:
             )
 
             human_pause(driver, 3)
+            if is_recaptcha_blocked(driver):
+                raise CaptchaBlocked("Google reCAPTCHA blocked the current IP after audio-button interaction.")
             if clicked and challenge.run_js("return !!document.querySelector('#audio-response');"):
                 log(f"Switched reCAPTCHA to audio mode on attempt {attempt}.")
                 return True
         except Exception as exc:
+            if isinstance(exc, CaptchaBlocked):
+                raise
             log(f"Audio switch attempt {attempt} failed: {exc}")
 
         human_pause(driver, 2)
@@ -351,6 +440,9 @@ def solve_recaptcha_with_buster(driver: Driver) -> bool:
     if is_recaptcha_solved(driver):
         return True
 
+    if is_recaptcha_blocked(driver):
+        raise CaptchaBlocked("Google reCAPTCHA already shows 'Try again later'.")
+
     if not click_recaptcha_checkbox(driver):
         return False
 
@@ -368,6 +460,8 @@ def solve_recaptcha_with_buster(driver: Driver) -> bool:
 
     deadline = time.time() + MAX_CAPTCHA_WAIT_SECONDS
     while time.time() < deadline:
+        if is_recaptcha_blocked(driver):
+            raise CaptchaBlocked("Google reCAPTCHA switched to 'Try again later' while Buster was solving.")
         if is_recaptcha_solved(driver):
             log("reCAPTCHA solved by Buster.")
             return True
@@ -426,78 +520,75 @@ def build_failure_message(url: str, server_name: str, old_expire: str, reason: s
 
 
 def renew_single_url(driver: Driver, url: str) -> bool:
-    server_name = "Unknown"
-    old_expire = "Unknown"
+    last_reason = "Unknown failure"
+    last_server_name = "Unknown"
+    last_old_expire = "Unknown"
 
-    try:
-        log(f"Opening renewal URL: {url}")
-        driver.get(url)
-        human_pause(driver, 8)
+    for attempt in range(1, MAX_RENEW_RETRIES_PER_URL + 1):
+        log(f"Renew attempt {attempt}/{MAX_RENEW_RETRIES_PER_URL} for {url}")
 
-        remove_overlays(driver)
-        human_pause(driver, 2)
+        try:
+            log(f"Opening renewal URL: {url}")
+            driver.get(url)
+            human_pause(driver, 8)
 
-        server_name = get_server_name(driver)
-        old_expire = get_expire_time(driver)
-        log(f"Detected server: {server_name}")
-        log(f"Expire time before renew: {old_expire}")
+            remove_overlays(driver)
+            human_pause(driver, 2)
 
-        if not open_renew_dialog(driver):
+            server_name = get_server_name(driver)
+            old_expire = get_expire_time(driver)
+            last_server_name = server_name
+            last_old_expire = old_expire
+
+            log(f"Detected server: {server_name}")
+            log(f"Expire time before renew: {old_expire}")
+
+            if not open_renew_dialog(driver):
+                last_reason = "Renew button not found."
+                break
+
+            if driver.is_element_present("iframe[src*='recaptcha/api2/anchor']"):
+                log("reCAPTCHA detected, starting audio-mode solve flow.")
+                if not solve_recaptcha_with_buster(driver):
+                    last_reason = "Failed to solve reCAPTCHA or switch to audio mode."
+                    break
+            else:
+                log("No reCAPTCHA frame detected after opening renew dialog.")
+
+            if not click_final_confirm(driver):
+                log("Final confirm button was not clicked, checking page state anyway.")
+
+            success, new_expire = detect_success(driver, old_expire)
             save_status_screenshot(driver)
-            send_tg_message(
-                build_failure_message(url, server_name, old_expire, "Renew button not found."),
-                SCREENSHOT_PATH,
-            )
-            return False
 
-        if driver.is_element_present("iframe[src*='recaptcha/api2/anchor']"):
-            log("reCAPTCHA detected, starting audio-mode solve flow.")
-            if not solve_recaptcha_with_buster(driver):
-                save_status_screenshot(driver)
+            if success:
                 send_tg_message(
-                    build_failure_message(
-                        url,
-                        server_name,
-                        old_expire,
-                        "Failed to solve reCAPTCHA or switch to audio mode.",
-                    ),
+                    build_success_message(url, server_name, old_expire, new_expire),
                     SCREENSHOT_PATH,
                 )
-                return False
-        else:
-            log("No reCAPTCHA frame detected after opening renew dialog.")
+                return True
 
-        if not click_final_confirm(driver):
-            log("Final confirm button was not clicked, checking page state anyway.")
+            last_reason = "Renew action finished but no success marker or expire-time change was detected."
+            break
 
-        success, new_expire = detect_success(driver, old_expire)
-        save_status_screenshot(driver)
+        except CaptchaBlocked as exc:
+            last_reason = str(exc)
+            log(f"reCAPTCHA blocked current IP: {last_reason}")
+            save_status_screenshot(driver)
+            if attempt < MAX_RENEW_RETRIES_PER_URL and restart_warp():
+                human_pause(driver, 6)
+                continue
+            break
+        except Exception as exc:
+            last_reason = str(exc)
+            save_status_screenshot(driver)
+            break
 
-        if success:
-            send_tg_message(
-                build_success_message(url, server_name, old_expire, new_expire),
-                SCREENSHOT_PATH,
-            )
-            return True
-
-        send_tg_message(
-            build_failure_message(
-                url,
-                server_name,
-                old_expire,
-                "Renew action finished but no success marker or expire-time change was detected.",
-            ),
-            SCREENSHOT_PATH,
-        )
-        return False
-
-    except Exception as exc:
-        save_status_screenshot(driver)
-        send_tg_message(
-            build_failure_message(url, server_name, old_expire, str(exc)),
-            SCREENSHOT_PATH,
-        )
-        return False
+    send_tg_message(
+        build_failure_message(url, last_server_name, last_old_expire, last_reason),
+        SCREENSHOT_PATH,
+    )
+    return False
 
 
 @browser(
