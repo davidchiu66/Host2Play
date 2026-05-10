@@ -187,7 +187,8 @@ def get_expire_time(driver: Driver) -> str:
 
 def save_status_screenshot(driver: Driver):
     try:
-        driver.save_screenshot(SCREENSHOT_NAME)
+        os.makedirs(os.path.dirname(SCREENSHOT_PATH), exist_ok=True)
+        driver.save_screenshot(SCREENSHOT_PATH)
     except Exception as exc:
         log(f"Screenshot failed: {exc}")
 
@@ -339,6 +340,50 @@ def wait_for_recaptcha_frame(driver: Driver, selector: str, timeout_seconds: int
     return False
 
 
+def has_recaptcha_challenge_frame(driver: Driver) -> bool:
+    return wait_for_recaptcha_frame(driver, "iframe[src*='recaptcha/api2/bframe']", 8)
+
+
+def is_audio_challenge_visible(driver: Driver) -> bool:
+    if not has_recaptcha_challenge_frame(driver):
+        return False
+    try:
+        challenge = find_recaptcha_challenge_frame(driver)
+        return bool(
+            challenge.run_js(
+                """
+                const input = document.querySelector('#audio-response');
+                return !!input;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def is_visual_challenge_visible(driver: Driver) -> bool:
+    if not has_recaptcha_challenge_frame(driver):
+        return False
+    try:
+        challenge = find_recaptcha_challenge_frame(driver)
+        return bool(
+            challenge.run_js(
+                """
+                const imageSelectors = [
+                    '.rc-imageselect-instructions',
+                    '.rc-imageselect-desc-wrapper',
+                    '.rc-imageselect-target',
+                    '.rc-image-tile-wrapper',
+                    '#rc-imageselect'
+                ];
+                return imageSelectors.some((selector) => !!document.querySelector(selector));
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def is_recaptcha_solved(driver: Driver) -> bool:
     try:
         anchor = find_recaptcha_anchor_frame(driver)
@@ -387,16 +432,21 @@ def switch_recaptcha_to_audio(driver: Driver) -> bool:
             challenge = find_recaptcha_challenge_frame(driver)
             if is_recaptcha_blocked(driver):
                 raise CaptchaBlocked("Google reCAPTCHA blocked the current IP before audio mode opened.")
-            if challenge.run_js("return !!document.querySelector('#audio-response');"):
+            if is_audio_challenge_visible(driver):
                 log("reCAPTCHA already in audio mode.")
                 return True
+
+            if not is_visual_challenge_visible(driver):
+                log(f"Challenge frame detected but visual challenge is not ready yet on attempt {attempt}.")
+                human_pause(driver, 2)
+                continue
 
             try:
                 challenge.click("#recaptcha-audio-button")
                 human_pause(driver, 3)
                 if is_recaptcha_blocked(driver):
                     raise CaptchaBlocked("Google reCAPTCHA blocked the current IP when switching to audio mode.")
-                if challenge.run_js("return !!document.querySelector('#audio-response');"):
+                if is_audio_challenge_visible(driver):
                     log(f"Switched reCAPTCHA to audio mode on attempt {attempt}.")
                     return True
             except Exception as exc:
@@ -435,7 +485,7 @@ def switch_recaptcha_to_audio(driver: Driver) -> bool:
             human_pause(driver, 3)
             if is_recaptcha_blocked(driver):
                 raise CaptchaBlocked("Google reCAPTCHA blocked the current IP after audio-button interaction.")
-            if clicked and challenge.run_js("return !!document.querySelector('#audio-response');"):
+            if clicked and is_audio_challenge_visible(driver):
                 log(f"Switched reCAPTCHA to audio mode on attempt {attempt}.")
                 return True
         except Exception as exc:
@@ -452,7 +502,7 @@ def trigger_buster_solver(driver: Driver) -> bool:
     challenge = find_recaptcha_challenge_frame(driver)
 
     clicked = False
-    for _ in range(5):
+    for attempt in range(1, 9):
         try:
             challenge.click("#solver-button")
             clicked = True
@@ -466,12 +516,18 @@ def trigger_buster_solver(driver: Driver) -> bool:
                         button.click();
                         return true;
                     }
+                    const buttonByTitle = document.querySelector('[title*="Buster"], [aria-label*="Buster"]');
+                    if (buttonByTitle) {
+                        buttonByTitle.click();
+                        return true;
+                    }
                     return false;
                     """
                 )
             )
             if clicked:
                 break
+        log(f"Buster solver button not ready on attempt {attempt}.")
         human_pause(driver, 2)
 
     if not clicked:
@@ -493,14 +549,32 @@ def solve_recaptcha_with_buster(driver: Driver) -> bool:
     if not click_recaptcha_checkbox(driver):
         return False
 
-    human_pause(driver, 3)
+    human_pause(driver, 4)
     if is_recaptcha_solved(driver):
         log("reCAPTCHA solved from checkbox without challenge.")
         return True
 
-    if not switch_recaptcha_to_audio(driver):
-        log("Failed to switch reCAPTCHA to audio mode.")
-        return False
+    if not has_recaptcha_challenge_frame(driver):
+        log("No challenge frame appeared after checkbox click; proceeding without audio switch.")
+        return is_recaptcha_solved(driver)
+
+    if is_visual_challenge_visible(driver):
+        log("Visual reCAPTCHA challenge detected, switching to audio mode.")
+        if not switch_recaptcha_to_audio(driver):
+            log("Failed to switch visual challenge to audio mode.")
+            return False
+    elif is_audio_challenge_visible(driver):
+        log("Audio challenge is already visible.")
+    else:
+        log("Challenge frame appeared, but neither visual nor audio challenge is ready yet.")
+        human_pause(driver, 3)
+        if is_visual_challenge_visible(driver):
+            if not switch_recaptcha_to_audio(driver):
+                log("Failed to switch delayed visual challenge to audio mode.")
+                return False
+        elif not is_audio_challenge_visible(driver):
+            log("Challenge type could not be determined.")
+            return False
 
     if not trigger_buster_solver(driver):
         return False
