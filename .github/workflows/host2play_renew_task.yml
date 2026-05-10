@@ -1,0 +1,75 @@
+name: Host2Play 自动续期
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0,11,22 * * *'
+    - cron: '30 2,13 * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  renew-host2play:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup WARP
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: Install Audio & Display Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb wget unzip curl p7zip-full pulseaudio alsa-utils ffmpeg
+          pulseaudio --start --exit-idle-time=-1 || true
+          pactl load-module module-null-sink sink_name=virtual_speaker || true
+          pactl set-default-sink virtual_speaker || true
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install botasaurus==4.0.97 requests==2.31.0 chrome-extension-python
+
+      - name: Download & Extract Buster Plugin
+        run: |
+          mkdir -p extensions/buster
+          wget -O extensions/buster/buster.zip https://github.com/dessant/buster/releases/download/v3.1.0/buster_captcha_solver_for_humans-3.1.0-chrome.zip
+          mkdir -p extensions/buster/unpacked
+          7z x -y extensions/buster/buster.zip -oextensions/buster/unpacked
+
+      - name: Check IP
+        run: |
+          echo "Current IP:"
+          curl -s https://api.ipify.org
+          echo
+          curl -s https://ipinfo.io
+
+      - name: Run Host2Play Renewal Script
+        env:
+          HOST2PLAY_URLS: ${{ secrets.HOST2PLAY_URLS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          BUSTER_EXTENSION_PATH: ${{ github.workspace }}/extensions/buster/unpacked
+        run: xvfb-run -a python host2play.py
+
+      - name: Upload Screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host2play-screenshots-${{ github.run_number }}
+          path: output/screenshots/*.png
+          retention-days: 7
+          if-no-files-found: ignore
