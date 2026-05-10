@@ -13,7 +13,7 @@ HOST2PLAY_URLS = [
 ]
 
 RENEW_URLS = HOST2PLAY_URLS or [
-    "https://host2play.gratis/server/renew?i=03cab61c-8431-4684-a7fa-8a422c7b6e10",
+    "",
 ]
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
