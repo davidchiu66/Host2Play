@@ -62,6 +62,10 @@ def get_browser_proxy() -> str | None:
     return proxy or None
 
 
+def is_proxy_enabled() -> bool:
+    return bool(get_browser_proxy())
+
+
 def send_tg_message(text: str, photo_path: str | None = None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("Telegram not configured, skipping notification.")
@@ -189,6 +193,10 @@ def save_status_screenshot(driver: Driver):
 
 
 def restart_warp() -> bool:
+    if is_proxy_enabled():
+        log("SOCKS5 proxy is enabled, skipping WARP restart.")
+        return False
+
     log("Restarting WARP to rotate IP.")
     try:
         subprocess.run(
@@ -614,7 +622,11 @@ def renew_single_url(driver: Driver, url: str) -> bool:
             last_reason = str(exc)
             log(f"reCAPTCHA blocked current IP: {last_reason}")
             save_status_screenshot(driver)
-            if attempt < MAX_RENEW_RETRIES_PER_URL and restart_warp():
+            if attempt < MAX_RENEW_RETRIES_PER_URL and not is_proxy_enabled() and restart_warp():
+                human_pause(driver, 6)
+                continue
+            if attempt < MAX_RENEW_RETRIES_PER_URL and is_proxy_enabled():
+                log("SOCKS5 proxy mode is active; retrying with the same configured proxy.")
                 human_pause(driver, 6)
                 continue
             break
