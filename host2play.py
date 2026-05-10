@@ -2,8 +2,16 @@ import os
 import re
 import time
 import subprocess
+import tempfile
 import requests
 from botasaurus.browser import browser, Driver
+
+try:
+    import speech_recognition as sr
+    from pydub import AudioSegment
+except ImportError:
+    sr = None
+    AudioSegment = None
 
 
 HOST2PLAY_URLS = [
@@ -23,6 +31,7 @@ SOCKS5_PROXY = os.environ.get("HOST2PLAY_SOCKS5_PROXY", "").strip() or os.enviro
 
 SCREENSHOT_NAME = "host2play_status.png"
 SCREENSHOT_PATH = os.path.join("output", "screenshots", SCREENSHOT_NAME)
+ROOT_SCREENSHOT_PATH = SCREENSHOT_NAME
 MAX_CAPTCHA_WAIT_SECONDS = 30
 POST_SOLVE_WAIT_SECONDS = 18
 MAX_RENEW_RETRIES_PER_URL = 3
@@ -189,6 +198,10 @@ def save_status_screenshot(driver: Driver):
     try:
         os.makedirs(os.path.dirname(SCREENSHOT_PATH), exist_ok=True)
         driver.save_screenshot(SCREENSHOT_PATH)
+        try:
+            driver.save_screenshot(ROOT_SCREENSHOT_PATH)
+        except Exception:
+            pass
     except Exception as exc:
         log(f"Screenshot failed: {exc}")
 
@@ -539,6 +552,152 @@ def trigger_buster_solver(driver: Driver) -> bool:
     return True
 
 
+def get_audio_download_url(driver: Driver) -> str | None:
+    if not has_recaptcha_challenge_frame(driver):
+        return None
+    try:
+        challenge = find_recaptcha_challenge_frame(driver)
+        return challenge.run_js(
+            """
+            const candidates = [
+                '.rc-audiochallenge-tdownload-link',
+                '.rc-audiochallenge-ndownload-link',
+                '#audio-source'
+            ];
+            for (const selector of candidates) {
+                const element = document.querySelector(selector);
+                if (!element) continue;
+                const value = element.href || element.src || element.getAttribute('href') || element.getAttribute('src');
+                if (value) return value;
+            }
+            return null;
+            """
+        )
+    except Exception:
+        return None
+
+
+def download_audio_file(url: str) -> str | None:
+    proxies = get_requests_proxies()
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.google.com/",
+    }
+
+    candidate_urls = [url]
+    if "google.com" in url:
+        candidate_urls.append(url.replace("google.com", "recaptcha.net"))
+    elif "recaptcha.net" in url:
+        candidate_urls.append(url.replace("recaptcha.net", "google.com"))
+
+    for candidate in candidate_urls:
+        try:
+            response = requests.get(candidate, headers=headers, timeout=30, proxies=proxies)
+            response.raise_for_status()
+            if len(response.content) < 512:
+                continue
+            path = tempfile.mktemp(suffix=".mp3")
+            with open(path, "wb") as file_obj:
+                file_obj.write(response.content)
+            return path
+        except Exception:
+            continue
+    return None
+
+
+def recognize_audio_file(mp3_path: str) -> str | None:
+    if not sr or not AudioSegment:
+        log("SpeechRecognition or pydub is not installed; audio fallback unavailable.")
+        return None
+
+    wav_path = mp3_path.replace(".mp3", ".wav")
+    try:
+        AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+        text = recognizer.recognize_google(audio_data)
+        return clean_text(text)
+    except Exception as exc:
+        log(f"Audio recognition failed: {exc}")
+        return None
+    finally:
+        for path in [wav_path, mp3_path]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+
+def submit_audio_response(driver: Driver, answer: str) -> bool:
+    if not has_recaptcha_challenge_frame(driver):
+        return False
+
+    try:
+        challenge = find_recaptcha_challenge_frame(driver)
+        challenge.run_js(
+            """
+            const input = document.querySelector('#audio-response');
+            if (input) {
+                input.value = '';
+            }
+            """
+        )
+        challenge.type("#audio-response", answer)
+        human_pause(driver, 1)
+        try:
+            challenge.click("#recaptcha-verify-button")
+        except Exception:
+            challenge.run_js(
+                """
+                const button = document.querySelector('#recaptcha-verify-button');
+                if (button) {
+                    button.click();
+                    return true;
+                }
+                return false;
+                """
+            )
+        return True
+    except Exception as exc:
+        log(f"Submitting audio response failed: {exc}")
+        return False
+
+
+def solve_audio_challenge_locally(driver: Driver) -> bool:
+    for attempt in range(1, 4):
+        audio_url = get_audio_download_url(driver)
+        if not audio_url:
+            log(f"Audio URL not found on attempt {attempt}.")
+            human_pause(driver, 2)
+            continue
+
+        mp3_path = download_audio_file(audio_url)
+        if not mp3_path:
+            log(f"Audio download failed on attempt {attempt}.")
+            human_pause(driver, 2)
+            continue
+
+        answer = recognize_audio_file(mp3_path)
+        if not answer:
+            log(f"Audio recognition returned empty result on attempt {attempt}.")
+            human_pause(driver, 2)
+            continue
+
+        log(f"Audio recognition result: {answer}")
+        if not submit_audio_response(driver, answer):
+            human_pause(driver, 2)
+            continue
+
+        human_pause(driver, 5)
+        if is_recaptcha_solved(driver):
+            log("reCAPTCHA solved by local audio fallback.")
+            return True
+
+    return False
+
+
 def solve_recaptcha_with_buster(driver: Driver) -> bool:
     if is_recaptcha_solved(driver):
         return True
@@ -576,20 +735,20 @@ def solve_recaptcha_with_buster(driver: Driver) -> bool:
             log("Challenge type could not be determined.")
             return False
 
-    if not trigger_buster_solver(driver):
-        return False
+    if trigger_buster_solver(driver):
+        deadline = time.time() + MAX_CAPTCHA_WAIT_SECONDS
+        while time.time() < deadline:
+            if is_recaptcha_blocked(driver):
+                raise CaptchaBlocked("Google reCAPTCHA switched to 'Try again later' while Buster was solving.")
+            if is_recaptcha_solved(driver):
+                log("reCAPTCHA solved by Buster.")
+                return True
+            human_pause(driver, 2)
+        log("Timed out waiting for Buster to solve reCAPTCHA.")
+    else:
+        log("Buster solver was unavailable, falling back to local audio recognition.")
 
-    deadline = time.time() + MAX_CAPTCHA_WAIT_SECONDS
-    while time.time() < deadline:
-        if is_recaptcha_blocked(driver):
-            raise CaptchaBlocked("Google reCAPTCHA switched to 'Try again later' while Buster was solving.")
-        if is_recaptcha_solved(driver):
-            log("reCAPTCHA solved by Buster.")
-            return True
-        human_pause(driver, 2)
-
-    log("Timed out waiting for Buster to solve reCAPTCHA.")
-    return False
+    return solve_audio_challenge_locally(driver)
 
 
 def click_final_confirm(driver: Driver) -> bool:
