@@ -19,12 +19,6 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup WARP
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          stack: dual
-          mode: client
-
       - name: Install Audio & Display Dependencies
         run: |
           sudo apt-get update
@@ -55,15 +49,22 @@ jobs:
           HOST2PLAY_SOCKS5_PROXY: ${{ secrets.HOST2PLAY_SOCKS5_PROXY }}
           SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
         run: |
-          if [ -n "$HOST2PLAY_SOCKS5_PROXY" ]; then
-            export ALL_PROXY="$HOST2PLAY_SOCKS5_PROXY"
-          elif [ -n "$SOCKS5_PROXY" ]; then
-            export ALL_PROXY="$SOCKS5_PROXY"
-          fi
-          echo "Current IP:"
-          curl -s https://api.ipify.org
-          echo
-          curl -s https://ipinfo.io
+          python - <<'PY'
+          import os
+          import requests
+
+          proxy = (os.environ.get("HOST2PLAY_SOCKS5_PROXY", "").strip()
+                   or os.environ.get("SOCKS5_PROXY", "").strip())
+          if proxy and "://" not in proxy:
+              proxy = f"socks5://{proxy}"
+
+          proxies = {"http": proxy, "https": proxy} if proxy else None
+
+          print("Current proxy:", proxy or "direct")
+          print("Current IP:")
+          print(requests.get("https://api.ipify.org", timeout=20, proxies=proxies).text)
+          print(requests.get("https://ipinfo.io", timeout=20, proxies=proxies).text)
+          PY
 
       - name: Run Host2Play Renewal Script
         env:
