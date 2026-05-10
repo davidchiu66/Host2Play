@@ -19,6 +19,7 @@ RENEW_URLS = HOST2PLAY_URLS or [
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 BUSTER_EXTENSION_PATH = os.environ.get("BUSTER_EXTENSION_PATH", "")
+SOCKS5_PROXY = os.environ.get("HOST2PLAY_SOCKS5_PROXY", "").strip() or os.environ.get("SOCKS5_PROXY", "").strip()
 
 SCREENSHOT_NAME = "host2play_status.png"
 SCREENSHOT_PATH = os.path.join("output", "screenshots", SCREENSHOT_NAME)
@@ -39,11 +40,34 @@ def human_sleep(seconds: int | float):
     time.sleep(seconds)
 
 
+def normalize_socks5_proxy(proxy_value: str) -> str:
+    if not proxy_value:
+        return ""
+
+    proxy_value = proxy_value.strip()
+    if "://" not in proxy_value:
+        return f"socks5://{proxy_value}"
+    return proxy_value
+
+
+def get_requests_proxies() -> dict[str, str] | None:
+    proxy = normalize_socks5_proxy(SOCKS5_PROXY)
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
+def get_browser_proxy() -> str | None:
+    proxy = normalize_socks5_proxy(SOCKS5_PROXY)
+    return proxy or None
+
+
 def send_tg_message(text: str, photo_path: str | None = None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("Telegram not configured, skipping notification.")
         return
 
+    proxies = get_requests_proxies()
     try:
         if photo_path and os.path.exists(photo_path):
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
@@ -53,11 +77,17 @@ def send_tg_message(text: str, photo_path: str | None = None):
                 "parse_mode": "HTML",
             }
             with open(photo_path, "rb") as photo_file:
-                requests.post(url, data=data, files={"photo": photo_file}, timeout=30)
+                requests.post(
+                    url,
+                    data=data,
+                    files={"photo": photo_file},
+                    timeout=30,
+                    proxies=proxies,
+                )
         else:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
             data = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-            requests.post(url, data=data, timeout=30)
+            requests.post(url, data=data, timeout=30, proxies=proxies)
         log("Telegram notification sent.")
     except Exception as exc:
         log(f"Telegram notification failed: {exc}")
@@ -193,6 +223,15 @@ def restart_warp() -> bool:
     except Exception as exc:
         log(f"WARP restart failed: {exc}")
         return False
+
+
+def log_public_ip():
+    proxies = get_requests_proxies()
+    try:
+        response = requests.get("https://api.ipify.org", timeout=20, proxies=proxies)
+        log(f"Current outbound IP: {response.text.strip()}")
+    except Exception as exc:
+        log(f"Failed to query public IP: {exc}")
 
 
 def remove_overlays(driver: Driver):
@@ -595,9 +634,15 @@ def renew_single_url(driver: Driver, url: str) -> bool:
     headless=False,
     window_size=(1920, 1080),
     extensions=get_extensions(),
+    proxy=get_browser_proxy(),
 )
 def host2play_renewal_task(driver: Driver, data):
     log("Buster extension loaded through Botasaurus.")
+    if get_browser_proxy():
+        log(f"SOCKS5 proxy enabled for browser: {get_browser_proxy()}")
+    else:
+        log("SOCKS5 proxy not configured; using direct network.")
+    log_public_ip()
     total = len(RENEW_URLS)
     success_count = 0
 
