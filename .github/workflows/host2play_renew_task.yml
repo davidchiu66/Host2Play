@@ -19,19 +19,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # ==========================================
-      # 2. 挂载 WARP 网络 (提升 IP 信誉，降低验证码难度)
-      # ==========================================
-      - name: Setup WARP
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          stack: dual
-          mode: client
-          
       - name: Install Audio & Display Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb wget unzip curl p7zip-full pulseaudio alsa-utils ffmpeg
+
+          # 启动虚拟声卡，骗过浏览器的音频硬件检测，激活 reCAPTCHA 语音模式
           pulseaudio --start --exit-idle-time=-1 || true
           pactl load-module module-null-sink sink_name=virtual_speaker || true
           pactl set-default-sink virtual_speaker || true
@@ -55,6 +48,7 @@ jobs:
 
       - name: Check IP
         env:
+          HOST2PLAY_SOCKS5_PROXIES: ${{ secrets.HOST2PLAY_SOCKS5_PROXIES }}
           HOST2PLAY_SOCKS5_PROXY: ${{ secrets.HOST2PLAY_SOCKS5_PROXY }}
           SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
         run: |
@@ -62,10 +56,23 @@ jobs:
           import os
           import requests
 
-          proxy = (os.environ.get("HOST2PLAY_SOCKS5_PROXY", "").strip()
-                   or os.environ.get("SOCKS5_PROXY", "").strip())
+          raw_proxy_pool = os.environ.get("HOST2PLAY_SOCKS5_PROXIES", "").strip()
+          proxy = ""
+          if raw_proxy_pool:
+              for line in raw_proxy_pool.splitlines():
+                  if line.strip():
+                      proxy = line.strip()
+                      break
+          if not proxy:
+              proxy = (os.environ.get("HOST2PLAY_SOCKS5_PROXY", "").strip()
+                       or os.environ.get("SOCKS5_PROXY", "").strip())
           if proxy and "://" not in proxy:
-              proxy = f"socks5://{proxy}"
+              if proxy.startswith("socks://"):
+                  proxy = "socks5://" + proxy[len("socks://"):]
+              else:
+                  proxy = f"socks5://{proxy}"
+          elif proxy.startswith("socks://"):
+              proxy = "socks5://" + proxy[len("socks://"):]
 
           proxies = {"http": proxy, "https": proxy} if proxy else None
 
@@ -81,6 +88,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BUSTER_EXTENSION_PATH: ${{ github.workspace }}/extensions/buster/unpacked
+          HOST2PLAY_SOCKS5_PROXIES: ${{ secrets.HOST2PLAY_SOCKS5_PROXIES }}
           HOST2PLAY_SOCKS5_PROXY: ${{ secrets.HOST2PLAY_SOCKS5_PROXY }}
           SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
         run: xvfb-run -a python host2play.py
