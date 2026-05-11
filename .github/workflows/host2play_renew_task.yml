@@ -54,6 +54,7 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import sys
           import requests
 
           raw_proxy_pool = os.environ.get("HOST2PLAY_SOCKS5_PROXIES", "").strip()
@@ -78,8 +79,12 @@ jobs:
 
           print("Current proxy:", proxy or "direct")
           print("Current IP:")
-          print(requests.get("https://api.ipify.org", timeout=20, proxies=proxies).text)
-          print(requests.get("https://ipinfo.io", timeout=20, proxies=proxies).text)
+          try:
+              print(requests.get("https://api.ipify.org", timeout=12, proxies=proxies).text)
+              print(requests.get("https://ipinfo.io", timeout=12, proxies=proxies).text)
+          except Exception as exc:
+              print(f"Proxy preflight warning: {exc}", file=sys.stderr)
+              print("Continuing to the renewal script anyway.")
           PY
 
       - name: Run Host2Play Renewal Script
