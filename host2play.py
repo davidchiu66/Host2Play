@@ -27,7 +27,9 @@ RENEW_URLS = HOST2PLAY_URLS or [
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 BUSTER_EXTENSION_PATH = os.environ.get("BUSTER_EXTENSION_PATH", "")
-SOCKS5_PROXY = os.environ.get("HOST2PLAY_SOCKS5_PROXY", "").strip() or os.environ.get("SOCKS5_PROXY", "").strip()
+RAW_PROXY_CONFIG = os.environ.get("HOST2PLAY_SOCKS5_PROXIES", "").strip() or os.environ.get(
+    "HOST2PLAY_SOCKS5_PROXY", ""
+).strip() or os.environ.get("SOCKS5_PROXY", "").strip()
 
 SCREENSHOT_NAME = "host2play_status.png"
 SCREENSHOT_PATH = os.path.join("output", "screenshots", SCREENSHOT_NAME)
@@ -35,6 +37,7 @@ ROOT_SCREENSHOT_PATH = SCREENSHOT_NAME
 MAX_CAPTCHA_WAIT_SECONDS = 30
 POST_SOLVE_WAIT_SECONDS = 18
 MAX_RENEW_RETRIES_PER_URL = 3
+CURRENT_TASK_PROXY = ""
 
 
 def log(message: str):
@@ -54,20 +57,54 @@ def normalize_socks5_proxy(proxy_value: str) -> str:
         return ""
 
     proxy_value = proxy_value.strip()
+    if proxy_value.startswith("socks://"):
+        return "socks5://" + proxy_value[len("socks://") :]
     if "://" not in proxy_value:
         return f"socks5://{proxy_value}"
     return proxy_value
 
 
+def get_proxy_pool() -> list[str]:
+    proxies = []
+    for line in RAW_PROXY_CONFIG.splitlines():
+        proxy = normalize_socks5_proxy(line)
+        if proxy:
+            proxies.append(proxy)
+    if not proxies:
+        single = normalize_socks5_proxy(RAW_PROXY_CONFIG)
+        if single:
+            proxies.append(single)
+    return proxies
+
+
+def get_proxy_from_data(data) -> str | None:
+    if isinstance(data, dict):
+        proxy = normalize_socks5_proxy(data.get("proxy", ""))
+        return proxy or None
+    return None
+
+
+def set_task_proxy(proxy: str):
+    global CURRENT_TASK_PROXY
+    CURRENT_TASK_PROXY = proxy
+
+
+def get_current_task_proxy() -> str:
+    if CURRENT_TASK_PROXY:
+        return CURRENT_TASK_PROXY
+    pool = get_proxy_pool()
+    return pool[0] if pool else ""
+
+
 def get_requests_proxies() -> dict[str, str] | None:
-    proxy = normalize_socks5_proxy(SOCKS5_PROXY)
+    proxy = get_current_task_proxy()
     if not proxy:
         return None
     return {"http": proxy, "https": proxy}
 
 
 def get_browser_proxy() -> str | None:
-    proxy = normalize_socks5_proxy(SOCKS5_PROXY)
+    proxy = get_current_task_proxy()
     return proxy or None
 
 
@@ -799,103 +836,179 @@ def build_failure_message(url: str, server_name: str, old_expire: str, reason: s
     )
 
 
-def renew_single_url(driver: Driver, url: str) -> bool:
-    last_reason = "Unknown failure"
-    last_server_name = "Unknown"
-    last_old_expire = "Unknown"
+def renew_single_attempt(driver: Driver, payload: dict) -> dict:
+    url = payload["url"]
+    attempt = payload["attempt"]
+    proxy = payload.get("proxy", "")
+    set_task_proxy(proxy)
 
-    for attempt in range(1, MAX_RENEW_RETRIES_PER_URL + 1):
-        log(f"Renew attempt {attempt}/{MAX_RENEW_RETRIES_PER_URL} for {url}")
+    server_name = "Unknown"
+    old_expire = "Unknown"
 
-        try:
-            log(f"Opening renewal URL: {url}")
-            driver.get(url)
-            human_pause(driver, 8)
+    if proxy:
+        log(f"Using SOCKS5 proxy for attempt {attempt}: {proxy}")
+    else:
+        log(f"Using direct network for attempt {attempt}.")
 
-            remove_overlays(driver)
-            human_pause(driver, 2)
+    log(f"Renew attempt {attempt}/{MAX_RENEW_RETRIES_PER_URL} for {url}")
 
-            server_name = get_server_name(driver)
-            old_expire = get_expire_time(driver)
-            last_server_name = server_name
-            last_old_expire = old_expire
+    try:
+        log(f"Opening renewal URL: {url}")
+        driver.get(url)
+        human_pause(driver, 8)
 
-            log(f"Detected server: {server_name}")
-            log(f"Expire time before renew: {old_expire}")
+        remove_overlays(driver)
+        human_pause(driver, 2)
 
-            if not open_renew_dialog(driver):
-                last_reason = "Renew button not found."
-                break
+        server_name = get_server_name(driver)
+        old_expire = get_expire_time(driver)
 
-            if driver.is_element_present("iframe[src*='recaptcha/api2/anchor']"):
-                log("reCAPTCHA detected, starting audio-mode solve flow.")
-                if not solve_recaptcha_with_buster(driver):
-                    last_reason = "Failed to solve reCAPTCHA or switch to audio mode."
-                    break
-            else:
-                log("No reCAPTCHA frame detected after opening renew dialog.")
+        log(f"Detected server: {server_name}")
+        log(f"Expire time before renew: {old_expire}")
 
-            if not click_final_confirm(driver):
-                log("Final confirm button was not clicked, checking page state anyway.")
-
-            success, new_expire = detect_success(driver, old_expire)
+        if not open_renew_dialog(driver):
             save_status_screenshot(driver)
+            return {
+                "success": False,
+                "reason": "Renew button not found.",
+                "server_name": server_name,
+                "old_expire": old_expire,
+            }
 
-            if success:
-                send_tg_message(
-                    build_success_message(url, server_name, old_expire, new_expire),
-                    SCREENSHOT_PATH,
-                )
-                return True
+        if driver.is_element_present("iframe[src*='recaptcha/api2/anchor']"):
+            log("reCAPTCHA detected, starting audio-mode solve flow.")
+            if not solve_recaptcha_with_buster(driver):
+                save_status_screenshot(driver)
+                return {
+                    "success": False,
+                    "reason": "Failed to solve reCAPTCHA or switch to audio mode.",
+                    "server_name": server_name,
+                    "old_expire": old_expire,
+                }
+        else:
+            log("No reCAPTCHA frame detected after opening renew dialog.")
 
-            last_reason = "Renew action finished but no success marker or expire-time change was detected."
-            break
+        if not click_final_confirm(driver):
+            log("Final confirm button was not clicked, checking page state anyway.")
 
-        except CaptchaBlocked as exc:
-            last_reason = str(exc)
-            log(f"reCAPTCHA blocked current IP: {last_reason}")
-            save_status_screenshot(driver)
-            if attempt < MAX_RENEW_RETRIES_PER_URL and not is_proxy_enabled() and restart_warp():
-                human_pause(driver, 6)
-                continue
-            if attempt < MAX_RENEW_RETRIES_PER_URL and is_proxy_enabled():
-                log("SOCKS5 proxy mode is active; retrying with the same configured proxy.")
-                human_pause(driver, 6)
-                continue
-            break
-        except Exception as exc:
-            last_reason = str(exc)
-            save_status_screenshot(driver)
-            break
+        success, new_expire = detect_success(driver, old_expire)
+        save_status_screenshot(driver)
 
-    send_tg_message(
-        build_failure_message(url, last_server_name, last_old_expire, last_reason),
-        SCREENSHOT_PATH,
-    )
-    return False
+        if success:
+            return {
+                "success": True,
+                "server_name": server_name,
+                "old_expire": old_expire,
+                "new_expire": new_expire,
+            }
+
+        return {
+            "success": False,
+            "reason": "Renew action finished but no success marker or expire-time change was detected.",
+            "server_name": server_name,
+            "old_expire": old_expire,
+        }
+
+    except CaptchaBlocked as exc:
+        save_status_screenshot(driver)
+        return {
+            "success": False,
+            "blocked": True,
+            "reason": str(exc),
+            "server_name": server_name,
+            "old_expire": old_expire,
+        }
+    except Exception as exc:
+        save_status_screenshot(driver)
+        return {
+            "success": False,
+            "reason": str(exc),
+            "server_name": server_name,
+            "old_expire": old_expire,
+        }
 
 
 @browser(
     headless=False,
     window_size=(1920, 1080),
     extensions=get_extensions(),
-    proxy=get_browser_proxy(),
+    proxy=get_proxy_from_data,
 )
-def host2play_renewal_task(driver: Driver, data):
+def run_host2play_attempt(driver: Driver, data):
+    set_task_proxy(data.get("proxy", ""))
     log("Buster extension loaded through Botasaurus.")
     if get_browser_proxy():
         log(f"SOCKS5 proxy enabled for browser: {get_browser_proxy()}")
     else:
         log("SOCKS5 proxy not configured; using direct network.")
     log_public_ip()
+    return renew_single_attempt(driver, data)
+
+
+def host2play_renewal_task():
     total = len(RENEW_URLS)
     success_count = 0
+    proxy_pool = get_proxy_pool()
+    max_attempts = max(MAX_RENEW_RETRIES_PER_URL, len(proxy_pool)) if proxy_pool else MAX_RENEW_RETRIES_PER_URL
 
     for index, url in enumerate(RENEW_URLS, start=1):
         log(f"Processing {index}/{total}: {url}")
-        if renew_single_url(driver, url):
-            success_count += 1
-        human_pause(driver, 5)
+
+        last_result = {
+            "success": False,
+            "reason": "Unknown failure",
+            "server_name": "Unknown",
+            "old_expire": "Unknown",
+        }
+
+        for attempt in range(1, max_attempts + 1):
+            proxy = proxy_pool[(attempt - 1) % len(proxy_pool)] if proxy_pool else ""
+            result = run_host2play_attempt(
+                {
+                    "url": url,
+                    "attempt": attempt,
+                    "proxy": proxy,
+                }
+            )
+            last_result = result
+
+            if result.get("success"):
+                send_tg_message(
+                    build_success_message(
+                        url,
+                        result["server_name"],
+                        result["old_expire"],
+                        result["new_expire"],
+                    ),
+                    SCREENSHOT_PATH,
+                )
+                success_count += 1
+                break
+
+            if result.get("blocked") and attempt < max_attempts:
+                if proxy_pool and len(proxy_pool) > 1:
+                    log("Current proxy was blocked; next retry will rotate to the next configured proxy.")
+                elif not proxy_pool and restart_warp():
+                    human_sleep(6)
+                else:
+                    log("Proxy/IP was blocked and no alternate proxy is configured.")
+                continue
+
+            if not result.get("blocked"):
+                break
+
+        if not last_result.get("success"):
+            send_tg_message(
+                build_failure_message(
+                    url,
+                    last_result.get("server_name", "Unknown"),
+                    last_result.get("old_expire", "Unknown"),
+                    last_result.get("reason", "Unknown failure"),
+                ),
+                SCREENSHOT_PATH,
+            )
+
+        human_sleep(5)
 
     if success_count != total:
         raise RuntimeError(f"Only {success_count}/{total} Host2Play renewals succeeded.")
