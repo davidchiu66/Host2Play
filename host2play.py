@@ -112,6 +112,23 @@ def is_proxy_enabled() -> bool:
     return bool(get_browser_proxy())
 
 
+def can_use_proxy(proxy: str) -> bool:
+    proxy = normalize_socks5_proxy(proxy)
+    if not proxy:
+        return True
+
+    try:
+        response = requests.get(
+            "https://api.ipify.org",
+            timeout=8,
+            proxies={"http": proxy, "https": proxy},
+        )
+        return response.ok and bool(response.text.strip())
+    except Exception as exc:
+        log(f"Skipping unavailable proxy {proxy}: {exc}")
+        return False
+
+
 def send_tg_message(text: str, photo_path: str | None = None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("Telegram not configured, skipping notification.")
@@ -963,6 +980,19 @@ def host2play_renewal_task():
 
         for attempt in range(1, max_attempts + 1):
             proxy = proxy_pool[(attempt - 1) % len(proxy_pool)] if proxy_pool else ""
+            if proxy and not can_use_proxy(proxy):
+                last_result = {
+                    "success": False,
+                    "blocked": True,
+                    "reason": f"Proxy health check failed: {proxy}",
+                    "server_name": "Unknown",
+                    "old_expire": "Unknown",
+                }
+                if attempt < max_attempts:
+                    log("Trying the next configured proxy because the current one failed health checks.")
+                    continue
+                break
+
             result = run_host2play_attempt(
                 {
                     "url": url,
